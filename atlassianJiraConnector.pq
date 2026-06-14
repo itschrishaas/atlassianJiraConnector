@@ -57,7 +57,6 @@ JiraImpl = (
     baseUrl as text,
     fieldList as nullable text,
     projectKeys as nullable text,
-    maxResults as nullable text,
     jqlQuery as nullable text,
     jqlOrderBy as nullable text,
     testDataOverride as nullable record
@@ -65,7 +64,6 @@ JiraImpl = (
     baseUrl,
     fieldList,
     projectKeys,
-    maxResults,
     jqlQuery,
     jqlOrderBy,
     testDataOverride
@@ -77,16 +75,14 @@ shared Jira = (
     #"Company Atlassian URL" as text,
     optional #"Field List (comma separated, e.g., summary,created)" as text,
     optional #"Project Keys (comma separated, e.g., PROJ1,PROJ2)" as text,
-    optional #"Max Number of Results (default: 1000)" as text,
-    optional #"JQL Query String (e.g., status=""Open"")" as text,
-    optional #"JQL Order By String (e.g. priority DESC, created DESC)" as text
+    optional #"JQL Filter (e.g., created>=-365d, status=""Open"") — default: created>=-365d" as text,
+    optional #"JQL Order By (e.g., priority DESC, created DESC)" as text
 ) => jiraNavTbl(
     #"Company Atlassian URL",
     #"Field List (comma separated, e.g., summary,created)",
     #"Project Keys (comma separated, e.g., PROJ1,PROJ2)",
-    #"Max Number of Results (default: 1000)",
-    #"JQL Query String (e.g., status=""Open"")",
-    #"JQL Order By String (e.g. priority DESC, created DESC)",
+    #"JQL Filter (e.g., created>=-365d, status=""Open"") — default: created>=-365d",
+    #"JQL Order By (e.g., priority DESC, created DESC)",
     null
 );
 
@@ -95,12 +91,11 @@ shared JiraTest = (
     #"Company Atlassian URL" as text,
     optional fieldList as text,
     optional projectKeys as text,
-    optional maxResults as text,
     optional jqlQuery as text,
     optional jqlOrderBy as text,
     optional testDataOverride as record
-) => 
-    jiraNavTbl(#"Company Atlassian URL", fieldList, projectKeys, maxResults, jqlQuery, jqlOrderBy, testDataOverride); 
+) =>
+    jiraNavTbl(#"Company Atlassian URL", fieldList, projectKeys, jqlQuery, jqlOrderBy, testDataOverride);
 
 
 
@@ -183,7 +178,6 @@ jiraQuery =
         optional fieldList as nullable list,
         optional jqlString as nullable text,
         optional jqlOrderByString as nullable text,
-        optional maxResults as nullable text,
         optional discoverLimits as nullable logical,
         optional useSimpleRetrieval as nullable logical,
         optional testOverride as nullable record
@@ -194,27 +188,14 @@ jiraQuery =
             actualFieldsList = if fieldList = null then null else fieldList,
             actualJqlString = if jqlString = null then null else jqlString,
             actualJqlOrderBy = if jqlOrderByString = null then null else jqlOrderByString,
-            actualMaxResults = if maxResults = null then "1000" else maxResults,
             shouldDiscoverLimits = if discoverLimits = null then false else discoverLimits,
-            useSimple = if useSimpleRetrieval = null then true else useSimpleRetrieval, // Default to Simple
+            useSimple = if useSimpleRetrieval = null then true else useSimpleRetrieval,
             useTestData = if testOverride = null then null else testOverride,
             fieldsText = if actualFieldsList = null then null else Text.Combine(actualFieldsList, ","),
 
         //somewhere in here build full query
         jqlQuery = buildJqlQuery(actualJqlProjectKey, actualJqlString, actualJqlOrderBy),
 
-        // Dynamic limit discovery (only if requested and JQL is provided)
-            optimalMaxResults =
-                if shouldDiscoverLimits and actualJqlProjectKey <> null
-                    then
-                        try DiscoverMaxResults(url, actualJqlProjectKey, useTestData)
-                        otherwise Number.FromText(actualMaxResults)
-                    else Number.FromText(actualMaxResults), // adjust for Simple
-                        
-            
-            maxResultsText = Number.ToText(optimalMaxResults),
-            maxResultsNumber = Number.FromText(maxResultsText),
-            
         // DATA RETRIEVAL: Choose between simple or paginated
             CombinedData = if useSimple then
                 jiraDataRetrievalSimple(
@@ -222,7 +203,6 @@ jiraQuery =
                     queryPath,
                     jqlQuery,
                     fieldsText,
-                    maxResultsText,
                     useTestData
                 )
             else
@@ -231,8 +211,6 @@ jiraQuery =
                     queryPath,
                     jqlQuery,
                     fieldsText,
-                    maxResultsText,
-                    maxResultsNumber,//why do we need both values? Right now they could be different, again why?
                     useTestData
                 ),
 
@@ -302,7 +280,6 @@ jiraNavTbl =
         companyURL as text,
         optional fields as text,
         optional projectKeys as text,
-        optional maxResults as text,
         optional jqlString as text,
         optional jqlOrderBy as text,
         optional testOverride as nullable record
@@ -337,6 +314,9 @@ jiraNavTbl =
                         )),
                         each _
                     ),
+
+            // Default JQL filter when none is provided — prevents accidental full-table scans.
+            effectiveJql = if jqlString = null or Text.Trim(jqlString) = "" then "created >= -365d" else jqlString,
 
             //if projectKeys = null, then check JQLstring for "project = " if project = is TRUE then get string after project = before AND/OR/(
             //how to extend for multiple project =, use list...
@@ -374,7 +354,6 @@ jiraNavTbl =
                         null, //fieldList
                         null, //jqlString
                         null, //jqlOrderByString
-                        null, //maxResults
                         null, //discoverLimits
                         false, //useSimpleRetrieval
                         null //testOverride
@@ -407,7 +386,7 @@ jiraNavTbl =
                             {"Valid Requested", List.Count(validKeys), Text.Combine(validKeys, ", ")},
                             {"Invalid Requested", List.Count(invalidKeys), Text.Combine(invalidKeys, ", ")},
                             {"Final Project Count", Table.RowCount(filteredProjects), ""},
-                            {"User Supplied JQL String", if jqlString = null then "(none)" else jqlString, "Additional JQL to be applied to issue retrieval"}
+                            {"JQL Filter Applied", effectiveJql, if jqlString = null or Text.Trim(jqlString) = "" then "No filter supplied — defaulted to created >= -365d" else "User supplied"}
                         }
                     )
                 in
@@ -423,18 +402,17 @@ jiraNavTbl =
 
             issues =
                 let
-                    getIssues = Table.AddColumn(getProjects, "Issues", 
+                    getIssues = Table.AddColumn(getProjects, "Issues",
                         each jiraQuery(
-                            URL, 
+                            URL,
                             "rest/api/3/search/jql",
                             "project=" & [key],
                             fieldsDynamic,
-                            jqlString,
-                            jqlOrderBy, //jqlOrderByString
-                            maxResults,
-                            false, // Don't discover limits in Phase 1
-                            true,   // Use simple retrieval
-                            testOverride // PASS TEST OVERRIDE
+                            effectiveJql,
+                            jqlOrderBy,
+                            false,
+                            false,
+                            testOverride
                         )
                     ),
                     issuesWithErrorHandling = Table.TransformColumns(getIssues, {"Issues", each 

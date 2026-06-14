@@ -89,7 +89,6 @@ let
         queryPath as text,
         actualJql as nullable text,
         fieldsText as nullable text,
-        maxResultsText as text,
         optional testOverride as nullable record
     ) =>
         let
@@ -104,7 +103,7 @@ let
                         baseParams = [
                             jql = actualJql,
                             fields = fieldsText,
-                            maxResults = maxResultsText
+                            maxResults = "1000"
                         ],
                         queryParams = Record.RemoveFields(baseParams, 
                             List.Select(Record.FieldNames(baseParams), each Record.Field(baseParams, _) = null)),
@@ -137,8 +136,6 @@ let
         queryPath as text,
         actualJql as nullable text,
         fieldsText as nullable text,
-        maxResultsText as text,
-        maxResultsNumber as number,
         optional testOverride as nullable record
     ) =>
         let
@@ -147,63 +144,127 @@ let
                 ExtractTestIssuesData(testOverride)
             else
                 let
-                    // Build query parameters dynamically, excluding null values
-                    BuildQueryParameters = (startAt as number) =>
+                    // Offset-based params (startAt) for endpoints like /rest/api/3/search
+                    BuildOffsetParams = (startAt as number) =>
                         let
                             baseParams = [
                                 startAt = Number.ToText(startAt),
-                                maxResults = maxResultsText
+                                maxResults = "100"
                             ],
                             withJql = if actualJql <> null then Record.AddField(baseParams, "jql", actualJql) else baseParams,
                             withFields = if fieldsText <> null then Record.AddField(withJql, "fields", fieldsText) else withJql
                         in
                             withFields,
 
-                    GetPage = (startAt as number) =>
+                    // Cursor-based params (nextPageToken) for endpoints like /rest/api/3/search/jql
+                    BuildCursorParams = (nextToken as nullable text) =>
                         let
-                            queryHeaders = [Accept = "application/json"],
-                            queryParameters = BuildQueryParameters(startAt),
-                            source = Web.Contents(
-                                url, [
-                                    RelativePath = queryPath,
-                                    Headers = queryHeaders,
-                                    Query = queryParameters
-                                ]
-                            ),
-                            jsonDoc = Json.Document(source)
+                            baseParams = [maxResults = "100"],
+                            withJql = if actualJql <> null then Record.AddField(baseParams, "jql", actualJql) else baseParams,
+                            withFields = if fieldsText <> null then Record.AddField(withJql, "fields", fieldsText) else withJql,
+                            withToken = if nextToken <> null and nextToken <> "" then Record.AddField(withFields, "nextPageToken", nextToken) else withFields
                         in
-                            jsonDoc,
+                            withToken,
 
+                    GetPage = (startAt as number) =>
+                        Json.Document(Web.Contents(url, [
+                            RelativePath = queryPath,
+                            Headers = [Accept = "application/json"],
+                            Query = BuildOffsetParams(startAt)
+                        ])),
+
+                    GetPageCursor = (nextToken as nullable text) =>
+                        Json.Document(Web.Contents(url, [
+                            RelativePath = queryPath,
+                            Headers = [Accept = "application/json"],
+                            Query = BuildCursorParams(nextToken)
+                        ])),
+
+                    ExtractDataArray = (pageResponse as record) =>
+                        if Record.HasFields(pageResponse, "issues") then pageResponse[issues]
+                        else if Record.HasFields(pageResponse, "values") then pageResponse[values]
+                        else if Record.HasFields(pageResponse, "results") then pageResponse[results]
+                        else null,
+
+                    IsLastPage = (pageResponse as record, startAt as number, pageSize as number) as logical =>
+                        let
+                            items = ExtractDataArray(pageResponse),
+                            count = if items <> null then List.Count(items) else 0
+                        in
+                            if count = 0 then
+                                true
+                            else if Record.HasFields(pageResponse, "total") and pageResponse[total] > 0 then
+                                startAt + count >= pageResponse[total]
+                            else if Record.HasFields(pageResponse, "isLast") then
+                                pageResponse[isLast]
+                            else
+                                count < pageSize,
+
+                    // First request: for cursor endpoints the initial call sends no nextPageToken.
+                    // BuildOffsetParams(0) is fine here — startAt is simply ignored by cursor endpoints.
                     firstResponse = GetPage(0),
                     isDirectArrayResponse = Value.Is(firstResponse, type list),
 
+                    firstPageItems = if not isDirectArrayResponse then ExtractDataArray(firstResponse) else null,
+                    firstPageCount = if firstPageItems <> null then List.Count(firstPageItems) else 0,
+                    rawPageSize =
+                        if not isDirectArrayResponse and Record.HasFields(firstResponse, "maxResults") then
+                            firstResponse[maxResults]
+                        else
+                            50000,
+                    actualPageSize =
+                        if firstPageCount >= 1 then firstPageCount
+                        else if rawPageSize <> null and rawPageSize >= 1 then rawPageSize
+                        else 1,
+
+                    // Detect cursor-based endpoint: /rest/api/3/search/jql returns nextPageToken;
+                    // /rest/api/3/search returns total. Sending startAt to the cursor endpoint is
+                    // ignored by Jira, causing every "next page" to return the same first page.
+                    isCursorBased = not isDirectArrayResponse and Record.HasFields(firstResponse, "nextPageToken"),
+
+                    // Cursor-based loop: use nextPageToken from each response.
+                    CursorPages = List.Generate(
+                        () => [Page = firstResponse, ItemsSoFar = 0, Done = false],
+                        each not [Done] and [Page] <> null,
+                        each
+                            let
+                                pageItems = ExtractDataArray([Page]),
+                                pageCount = if pageItems <> null then List.Count(pageItems) else 0,
+                                newTotal  = [ItemsSoFar] + pageCount,
+                                isLast    = if Record.HasFields([Page], "isLast") then [Page][isLast] else true,
+                                rawToken  = if Record.HasFields([Page], "nextPageToken") then [Page][nextPageToken] else null,
+                                nextToken = if rawToken <> null and rawToken <> "" then rawToken else null,
+                                done      = isLast or nextToken = null
+                            in
+                                if done then
+                                    [Page = null, ItemsSoFar = newTotal, Done = true]
+                                else
+                                    [Page = GetPageCursor(nextToken), ItemsSoFar = newTotal, Done = false],
+                        each ExtractDataArray([Page])
+                    ),
+
+                    // Offset-based loop: increment startAt by actualPageSize each request.
+                    OffsetPages = List.Generate(
+                        () => [Page = firstResponse, StartAt = 0, Done = false],
+                        each not [Done] and [Page] <> null,
+                        each
+                            let
+                                nextStart = [StartAt] + actualPageSize,
+                                done      = IsLastPage([Page], [StartAt], actualPageSize)
+                            in
+                                if done then
+                                    [Page = null, StartAt = nextStart, Done = true]
+                                else
+                                    [Page = GetPage(nextStart), StartAt = nextStart, Done = false],
+                        each ExtractDataArray([Page])
+                    ),
+
                     GetAllPages = if isDirectArrayResponse then
                         {firstResponse}
+                    else if isCursorBased then
+                        CursorPages
                     else
-                        let
-                            ExtractDataArray = (pageResponse as record) =>
-                                if Record.HasFields(pageResponse, "issues") then pageResponse[issues]
-                                else if Record.HasFields(pageResponse, "values") then pageResponse[values]  
-                                else if Record.HasFields(pageResponse, "results") then pageResponse[results]
-                                else null,
-                            
-                            isPaginated = Record.HasFields(firstResponse, "isLast") or Record.HasFields(firstResponse, "total")
-                        in
-                            if isPaginated then
-                                List.Generate(
-                                    () => [Page = firstResponse, StartAt = 0],
-                                    each [Page] <> null and 
-                                        ExtractDataArray([Page]) <> null and
-                                        ([Page][isLast]? <> true),
-                                    each 
-                                        let
-                                            nextStartAt = [StartAt] + maxResultsNumber
-                                        in
-                                            [Page = GetPage(nextStartAt), StartAt = nextStartAt],
-                                    each ExtractDataArray([Page])
-                                )
-                            else
-                                {ExtractDataArray(firstResponse)}
+                        OffsetPages
                 in
                     List.Combine(List.RemoveNulls(GetAllPages))
         in

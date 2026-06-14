@@ -29,6 +29,9 @@ Version: 1.0.9 (connector Version updated in code)
       - Browse to the *.mez connector file.
       - Open in Winzip (or other archive tool); or modify the file extension to *.zip, (revert for implementation/use in Power BI / Power BI Gateway)
       - Copy ID and Secret file into the zip (*.mez) archive
+- **Full pagination support** is now implemented — the connector automatically pages through all results using either cursor-based (`nextPageToken`) or offset-based (`startAt`) pagination depending on the endpoint. There is no longer a cap on the number of issues returned per project.
+- **`Max Number of Results` parameter removed** — result scope is now controlled via JQL filters instead of a hard row limit.
+- **Default JQL filter** — when no JQL filter is provided, the connector automatically applies `created >= -365d`. This prevents accidental full-table scans and keeps initial loads fast. Override by supplying your own JQL filter string.
 - Support for Custom Sort Order
   - Sort by any valid fields, ASC or DESC
   - Combine multiple sorts into a single statement.
@@ -43,14 +46,16 @@ Version: 1.0.9 (connector Version updated in code)
 
 ## 🚀 Features
 
-- **Direct Jira Integration**: Connect to any Jira Cloud instance using API tokens
+- **Direct Jira Integration**: Connect to any Jira Cloud instance using API tokens or OAuth
+- **Full Pagination**: Automatically fetches all pages of results — no row cap, no manual configuration required
+- **Default Date Filter**: Applies `created >= -365d` when no JQL is provided to avoid accidental full-table scans
 - **Navigation Table**: Browse projects and issues through an intuitive folder structure
 - **Field Customization**: Specify which Jira fields to retrieve for optimal performance
 - **Project Filtering**: Filter data by specific Jira projects during connection
-- **Custom JQL**:include custom JQL filters and sorting
+- **Custom JQL**: Include custom JQL filters and sorting; defaults to last 365 days when omitted
 - **Dynamic Field Expansion**: Automatically expands nested Jira field structures
-- **JPD Insights Retrieval**: return Insights on Issues from JPD Projects
-- **Phase 2 MVP**: Support for OAuth
+- **JPD Insights Retrieval**: return Insights on Issues from JPD Projects (OAuth only)
+- **Support for OAuth**: 3-legged OAuth 2.0 flow
 - **Built-in support for mock/test data**: used by the test harness
 
 ## 📋 Prerequisites
@@ -116,12 +121,11 @@ When connecting through Power BI:
 
 | Parameter | Description | Example |
 |-----------|-------------|---------|
-| **Company URL Identifier** | Your Jira instance name (without `.atlassian.net`) | `acmesoftware` |
+| **Company URL Identifier** | Your Jira instance URL (full `https://` string required) | `https://acmesoftware.atlassian.net` |
 | **Field List** (Optional) | Comma-separated list of Jira fields to retrieve | `id,key,summary,created,assignee` |
 | **Project Keys** (Optional) | Comma-separated list of project keys to filter | `PROJECT1,PROJECT2` |
-| **Max Number of Results** (Optional) | Numerical value for the number of results to return from each Jira project, default is 1,000 | `2000` |
-| **JQL Query String** (optional) | Custom JQL query string, appended to base query with an ```AND``` wrapped in Parenthesis ```()```, **DO NOT** include a project arguement. | `status = "In Progress"` |
-| **JQL Order By String** (optional) | Custom JQL ORDER BY string, automatically appended to end of JQL query. Supports ASC and DESC, multiple fields | '"created DESC, priority DESC"' |
+| **JQL Filter** (Optional) | Custom JQL filter, appended to the project key with `AND` and wrapped in `()`. **DO NOT** include a `project` argument. Defaults to `created >= -365d` when left blank. | `status = "In Progress"` |
+| **JQL Order By** (Optional) | Custom JQL `ORDER BY` clause, appended to the end of the query. Supports `ASC`/`DESC` and multiple fields. | `created DESC, priority DESC` |
 
 ### Authentication
 
@@ -194,18 +198,17 @@ CI Suggestions
 ## 📊 Usage Examples
 
 ### Basic Connection
-Company URL Identifier: mycompany
+Company URL: https://mycompany.atlassian.net
 Field List: (leave blank for default fields) - id, key, summary, description, issuetype, created, components
 Project Keys: (leave blank for all projects)
-Max Results: (leave blank to return 1,000 rows)
-JQL Query String: (leave blank to return the top N rows from each project)
+JQL Filter: (leave blank — defaults to `created >= -365d`)
 
 ### Specific Projects with Custom Fields
-Company URL Identifier: mycompany
+Company URL: https://mycompany.atlassian.net
 Field List: id,key,summary,status,assignee,created,updated
 Project Keys: PROJ1,PROJ2,WEBDEV
-JQL Query String: (status="In Progress") OR (priority="Major")
-JQL Order By String: created DESC, priority DESC
+JQL Filter: (status="In Progress") OR (priority="Major")
+JQL Order By: created DESC, priority DESC
 
 ## 🏗️ Architecture
 
@@ -240,8 +243,8 @@ atlassianJiraConnector/
 ### Key Components
 
 #### Data Retrieval
-- **Phase 1**: `jiraDataRetrievalSimple()` - Single API calls (current)
-- **Phase 2**: `jiraDataRetrievalPaginated()` - Full pagination (OAuth)
+- **`jiraDataRetrievalPaginated()`** — Full pagination (used for issue queries). Supports both cursor-based (`nextPageToken`, used by `/rest/api/3/search/jql`) and offset-based (`startAt`, used by `/rest/api/3/search`) endpoints. Fetches all pages automatically.
+- **`jiraDataRetrievalSimple()`** — Single-request retrieval, used only for project listing and similar non-paginated endpoints.
 
 #### Core Functions
 - **`jiraQuery()`**: Universal query function with transformation
@@ -250,20 +253,21 @@ atlassianJiraConnector/
 
 ## 📈 Performance Considerations
 
-### Current Limitations (Phase 1)
-- **Maximum ~1000-2000 issues per project** (API token limitation)
-- **No automatic pagination** (single large requests)
-- **Sequential project processing** (not parallelized)
+### Pagination
+The connector automatically fetches all pages of results — there is no hard row cap. Each page request fetches up to 100 issues.
+
+- For large projects, use the **JQL Filter** to narrow the result set (e.g., `created >= -90d`, `status = "In Progress"`).
+- The default filter `created >= -365d` is applied automatically when no JQL is provided.
 
 ### Optimization Tips
-- Use **Project Keys** parameter to limit scope
-- Specify **Field List** to reduce payload size
-- Consider breaking large projects into smaller queries
+- Use **Project Keys** to limit scope to the projects you need
+- Specify **Field List** to reduce payload size per issue
+- Use a tighter JQL date range for very large projects (> 10,000 issues)
+- Sequential project processing (not parallelized) — fetching many projects in one load will take proportionally longer
 
-### Phase 2 Improvements (Planned)
-- **OAuth 3LO Authentication** for unlimited pagination
-- **Jira Product Discovery Insights** retrieve via Polaris Graphql endpoints
-- **Incremental refresh support**
+### Known Limitations
+- **Sequential project processing** — projects are loaded one at a time, not in parallel
+- **Incremental refresh** — not yet supported; each refresh re-fetches from the API
 
 ## 🔒 Security
 
@@ -362,7 +366,7 @@ When reporting issues, please include:
 
 ### Phase 2 🚧 (Planned/Active)
 - [x] OAuth 3LO authentication implementation* (unsecure)
-- [ ] Full pagination support
+- [x] Full pagination support (cursor-based and offset-based)
 - [x] Jira Product Discovery (JPD) Insights retreival
 - [ ] Performance optimizations
 - [x] Advanced filtering options
@@ -380,5 +384,3 @@ When reporting issues, please include:
 **Repository**: [GitHub Repository URL]
 
 ---
-
-*Last updated: November 10, 2025*
