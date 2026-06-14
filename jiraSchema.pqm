@@ -26,33 +26,34 @@ let
             }
         ),
 
-    // Infer types from field names and sample data
+    // Infer types from field names and value shape.
+    // For custom fields without a "date" in the name, detect ISO 8601 datetime strings
+    // by structure (YYYY-MM-DDTHH…) rather than by trying to parse the value — avoids
+    // mis-typing text fields whose content happens to be parseable as a date.
     InferJiraFieldType = (fieldName as text, sampleValue as any) as type =>
         let
             lowerFieldName = Text.Lower(fieldName),
-            
-            // Custom field pattern recognition
-            typeFromName = if Text.StartsWith(lowerFieldName, "customfield_") then
-                if Text.Contains(lowerFieldName, "date") then type datetimezone
-                else if Text.Contains(lowerFieldName, "number") then type number
-                else if Text.Contains(lowerFieldName, "user") then type any
-                else type any
-            else type any,
-                
-            // Sample value analysis
-            typeFromValue = if typeFromName = type any then
-                if sampleValue is text then
-                    if try DateTime.FromText(sampleValue) <> null otherwise false then
-                        type datetimezone
-                    else if try Number.FromText(sampleValue) <> null otherwise false then
-                        type number
-                    else type text
+            typeFromName =
+                if Text.StartsWith(lowerFieldName, "customfield_") then
+                    if Text.Contains(lowerFieldName, "date") then type datetimezone
+                    else type any
+                else type any,
+            // ISO 8601: positions 4, 7 = "-" and position 10 = "T"
+            isIso8601Text =
+                sampleValue is text and
+                Text.Length(sampleValue) >= 20 and
+                Text.At(sampleValue, 4)  = "-" and
+                Text.At(sampleValue, 7)  = "-" and
+                Text.At(sampleValue, 10) = "T",
+            typeFromValue =
+                if typeFromName <> type any then typeFromName
+                else if isIso8601Text then type datetimezone
+                else if sampleValue is text then type text
                 else if sampleValue is number then type number
                 else if sampleValue is list then type any
                 else if sampleValue is record then type any
                 else if sampleValue is table then type any
                 else type any
-            else typeFromName
         in
             typeFromValue,
 

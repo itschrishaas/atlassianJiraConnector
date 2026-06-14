@@ -218,12 +218,18 @@ jiraQuery =
             ConvertToTable = Table.FromList(CombinedData, Splitter.SplitByNothing(), null, null, ExtraValues.Error),
             
             // Dynamic field expansion
-            ExpandedTable = 
+            ExpandedTable =
                 let
-                // First expand the main issue fields (id, key, self, fields, etc.)
+                // First expand the main issue fields (id, key, fields, etc.)
+                // self and expand are Jira API internals — excluded unless explicitly requested.
                     firstRecord = if Table.RowCount(ConvertToTable) > 0 then ConvertToTable{0}[Column1] else null,
-                    topLevelFields = if firstRecord <> null then Record.FieldNames(firstRecord) else {},
-                    
+                    allTopLevelFields = if firstRecord <> null then Record.FieldNames(firstRecord) else {},
+                    autoExclude = {"self", "expand", "id"},
+                    topLevelFields = List.Select(allTopLevelFields, each
+                        not List.Contains(autoExclude, _) or
+                        (actualFieldsList <> null and List.Contains(actualFieldsList, _))
+                    ),
+
                     expandedTop = if List.Count(topLevelFields) > 0 then
                         Table.ExpandRecordColumn(ConvertToTable, "Column1", topLevelFields, topLevelFields)
                     else
